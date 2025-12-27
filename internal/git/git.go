@@ -196,3 +196,84 @@ func GetRepoShortName(url string) string {
 	r, _ = strings.CutSuffix(r, ".git")
 	return r
 }
+
+// GetUpstreamUrl returns the URL of the "upstream" remote if it exists.
+// This is typically the parent repository when working in a fork.
+func GetUpstreamUrl(dir string) (string, error) {
+	repo, err := gitm.Open(dir)
+	if err != nil {
+		return "", err
+	}
+	remotes, err := repo.Remotes()
+	if err != nil {
+		return "", err
+	}
+
+	for _, remote := range remotes {
+		if remote != "upstream" {
+			continue
+		}
+
+		urls, err := gitm.RemoteGetURL(dir, remote)
+		if err != nil || len(urls) == 0 {
+			return "", err
+		}
+		return urls[0], nil
+	}
+
+	return "", errors.New("no upstream remote found")
+}
+
+// ParseGitHubRepoFromUrl extracts the owner and repo name from a GitHub URL
+// Supports formats:
+//   - HTTPS: https://github.com/owner/repo.git, https://github.enterprise.com/owner/repo
+//   - SSH: git@github.com:owner/repo.git, git@github.enterprise.com:owner/repo.git
+func ParseGitHubRepoFromUrl(remoteUrl string) (owner, name string, err error) {
+	remoteUrl = strings.TrimSpace(remoteUrl)
+	remoteUrl = strings.TrimSuffix(remoteUrl, "/")
+
+	// Handle SSH format: git@host:owner/repo.git
+	if strings.HasPrefix(remoteUrl, "git@") {
+		// Find the colon that separates host from path
+		colonIdx := strings.Index(remoteUrl, ":")
+		if colonIdx == -1 {
+			return "", "", errors.New("invalid SSH URL format: missing colon separator")
+		}
+		path := remoteUrl[colonIdx+1:]
+		path = strings.TrimSuffix(path, ".git")
+		path = strings.TrimPrefix(path, "/") // Handle git@host:/owner/repo format
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return "", "", errors.New("invalid SSH URL format: expected owner/repo")
+		}
+		return parts[0], parts[1], nil
+	}
+
+	// Handle HTTPS/HTTP format using net/url parsing
+	if strings.HasPrefix(remoteUrl, "https://") || strings.HasPrefix(remoteUrl, "http://") {
+		// Simple path extraction - find host end and parse remaining path
+		var path string
+		if strings.HasPrefix(remoteUrl, "https://") {
+			path = strings.TrimPrefix(remoteUrl, "https://")
+		} else {
+			path = strings.TrimPrefix(remoteUrl, "http://")
+		}
+
+		// Find the first slash after host
+		slashIdx := strings.Index(path, "/")
+		if slashIdx == -1 {
+			return "", "", errors.New("invalid HTTPS URL format: missing path")
+		}
+		path = path[slashIdx+1:]
+		path = strings.TrimSuffix(path, ".git")
+		path = strings.TrimSuffix(path, "/")
+
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return "", "", errors.New("invalid HTTPS URL format: expected owner/repo")
+		}
+		return parts[0], parts[1], nil
+	}
+
+	return "", "", errors.New("unsupported URL format: expected git@ or https:// prefix")
+}
