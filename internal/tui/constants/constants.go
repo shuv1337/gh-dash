@@ -62,6 +62,5 @@ const (
 
 	UnknownRoleIcon = "󱐡" // \udb85\udc21 nf-md-incognito_circle
 
-	Logo = `▜▔▚▐▔▌▚▔▐ ▌
-▟▁▞▐▔▌▁▚▐▔▌`
+	Logo = `shuvdash`
 )
