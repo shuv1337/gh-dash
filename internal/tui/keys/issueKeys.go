@@ -17,6 +17,9 @@ type IssueKeyMap struct {
 	Close                key.Binding
 	Reopen               key.Binding
 	ToggleSmartFiltering key.Binding
+	ToggleRepoFilter     key.Binding
+	ToggleAuthorFilter   key.Binding
+	OpenRepoPicker       key.Binding
 	ViewPRs              key.Binding
 }
 
@@ -45,6 +48,18 @@ var IssueKeys = IssueKeyMap{
 		key.WithKeys("t"),
 		key.WithHelp("t", "toggle smart filtering"),
 	),
+	ToggleRepoFilter: key.NewBinding(
+		key.WithKeys("T"),
+		key.WithHelp("T", "cycle repo filter (origin/upstream/all)"),
+	),
+	ToggleAuthorFilter: key.NewBinding(
+		key.WithKeys("F"),
+		key.WithHelp("F", "toggle author filter"),
+	),
+	OpenRepoPicker: key.NewBinding(
+		key.WithKeys("R"),
+		key.WithHelp("R", "select repo filter"),
+	),
 	ViewPRs: key.NewBinding(
 		key.WithKeys("s"),
 		key.WithHelp("s", "switch to PRs"),
@@ -60,6 +75,9 @@ func IssueFullHelp() []key.Binding {
 		IssueKeys.Close,
 		IssueKeys.Reopen,
 		IssueKeys.ToggleSmartFiltering,
+		IssueKeys.ToggleRepoFilter,
+		IssueKeys.ToggleAuthorFilter,
+		IssueKeys.OpenRepoPicker,
 		IssueKeys.ViewPRs,
 	}
 }
@@ -105,6 +123,12 @@ func rebindIssueKeys(keys []config.Keybinding) error {
 			key = &IssueKeys.Reopen
 		case "viewPrs":
 			key = &IssueKeys.ViewPRs
+		case "toggleRepoFilter":
+			key = &IssueKeys.ToggleRepoFilter
+		case "toggleAuthorFilter":
+			key = &IssueKeys.ToggleAuthorFilter
+		case "openRepoPicker":
+			key = &IssueKeys.OpenRepoPicker
 		default:
 			return fmt.Errorf("unknown built-in issue key: '%s'", issueKey.Builtin)
 		}

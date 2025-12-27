@@ -26,6 +26,9 @@ type PRKeyMap struct {
 	Update               key.Binding
 	WatchChecks          key.Binding
 	ToggleSmartFiltering key.Binding
+	ToggleRepoFilter     key.Binding
+	ToggleAuthorFilter   key.Binding
+	OpenRepoPicker       key.Binding
 	ViewIssues           key.Binding
 }
 
@@ -94,6 +97,18 @@ var PRKeys = PRKeyMap{
 		key.WithKeys("t"),
 		key.WithHelp("t", "toggle smart filtering"),
 	),
+	ToggleRepoFilter: key.NewBinding(
+		key.WithKeys("T"),
+		key.WithHelp("T", "cycle repo filter (origin/upstream/all)"),
+	),
+	ToggleAuthorFilter: key.NewBinding(
+		key.WithKeys("F"),
+		key.WithHelp("F", "toggle author filter"),
+	),
+	OpenRepoPicker: key.NewBinding(
+		key.WithKeys("R"),
+		key.WithHelp("R", "select repo filter"),
+	),
 	ViewIssues: key.NewBinding(
 		key.WithKeys("s"),
 		key.WithHelp("s", "switch to issues"),
@@ -117,6 +132,9 @@ func PRFullHelp() []key.Binding {
 		PRKeys.Update,
 		PRKeys.WatchChecks,
 		PRKeys.ToggleSmartFiltering,
+		PRKeys.ToggleRepoFilter,
+		PRKeys.ToggleAuthorFilter,
+		PRKeys.OpenRepoPicker,
 		PRKeys.ViewIssues,
 	}
 }
@@ -180,6 +198,12 @@ func rebindPRKeys(keys []config.Keybinding) error {
 			key = &PRKeys.ViewIssues
 		case "summaryViewMore":
 			key = &PRKeys.SummaryViewMore
+		case "toggleRepoFilter":
+			key = &PRKeys.ToggleRepoFilter
+		case "toggleAuthorFilter":
+			key = &PRKeys.ToggleAuthorFilter
+		case "openRepoPicker":
+			key = &PRKeys.OpenRepoPicker
 		default:
 			return fmt.Errorf("unknown built-in pr key: '%s'", prKey.Builtin)
 		}
