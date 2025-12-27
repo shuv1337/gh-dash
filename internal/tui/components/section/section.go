@@ -12,19 +12,29 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
-	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/go-sprout/sprout"
 	timeregistry "github.com/go-sprout/sprout/registry/time"
 
 	"github.com/dlvhdr/gh-dash/v4/internal/config"
 	"github.com/dlvhdr/gh-dash/v4/internal/data"
+	"github.com/dlvhdr/gh-dash/v4/internal/git"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/common"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/prompt"
+	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/repopicker"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/search"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/table"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/constants"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/context"
 	"github.com/dlvhdr/gh-dash/v4/internal/utils"
+)
+
+// FilterTarget represents which repository to filter by when smart filtering is enabled
+type FilterTarget int
+
+const (
+	FilterTargetOrigin   FilterTarget = iota // Filter by origin (current fork)
+	FilterTargetUpstream                     // Filter by upstream (parent repo)
+	FilterTargetNone                         // No repo filter applied
 )
 
 type BaseModel struct {
@@ -50,6 +60,16 @@ type BaseModel struct {
 	ShowAuthorIcon            bool
 	IsFilteredByCurrentRemote bool
 	IsLoading                 bool
+	// FilterTarget indicates which repo to filter by (origin, upstream, or none)
+	FilterTarget FilterTarget
+	// IsAuthorFilterRemoved indicates if the author:@me filter has been removed
+	IsAuthorFilterRemoved bool
+	// CustomRepoFilter is a manually specified repo filter that overrides FilterTarget
+	CustomRepoFilter string
+	// IsRepoPickerShown indicates if the repo picker is currently shown
+	IsRepoPickerShown bool
+	// RepoPicker is the repo picker component
+	RepoPicker repopicker.Model
 }
 
 type NewSectionOptions struct {
@@ -69,16 +89,28 @@ func (options NewSectionOptions) GetConfigFiltersWithCurrentRemoteAdded(ctx *con
 	if !ctx.Config.SmartFilteringAtLaunch {
 		return searchValue
 	}
-	repo, err := repository.Current()
+
+	// Get origin from git remote directly, not repository.Current()
+	// which may resolve to the upstream/parent repo instead of the fork
+	repoDir := "."
+	if ctx != nil && ctx.RepoPath != "" {
+		repoDir = ctx.RepoPath
+	}
+	originUrl, err := git.GetOriginUrl(repoDir)
 	if err != nil {
 		return searchValue
 	}
+	owner, name, err := git.ParseGitHubRepoFromUrl(originUrl)
+	if err != nil {
+		return searchValue
+	}
+
 	for token := range strings.FieldsSeq(searchValue) {
 		if strings.HasPrefix(token, "repo:") {
 			return searchValue
 		}
 	}
-	return fmt.Sprintf("repo:%s/%s %s", repo.Owner, repo.Name, searchValue)
+	return fmt.Sprintf("repo:%s/%s %s", owner, name, searchValue)
 }
 
 func NewModel(
@@ -86,6 +118,10 @@ func NewModel(
 	options NewSectionOptions,
 ) BaseModel {
 	filters := options.GetConfigFiltersWithCurrentRemoteAdded(ctx)
+	filterTarget := FilterTargetNone
+	if ctx.Config.SmartFilteringAtLaunch && filters != options.Config.Filters {
+		filterTarget = FilterTargetOrigin
+	}
 	m := BaseModel{
 		Ctx:          ctx,
 		Id:           options.Id,
@@ -106,9 +142,15 @@ func NewModel(
 		PageInfo:                  nil,
 		PromptConfirmationBox:     prompt.NewModel(ctx),
 		ShowAuthorIcon:            ctx.Config.ShowAuthorIcons,
+		FilterTarget:              filterTarget,
+		IsAuthorFilterRemoved:     false,
+		CustomRepoFilter:          "",
+		IsRepoPickerShown:         false,
+		RepoPicker:                repopicker.NewModel(ctx),
 	}
 	if !ctx.Config.SmartFilteringAtLaunch {
 		m.IsFilteredByCurrentRemote = false
+		m.FilterTarget = FilterTargetNone
 	}
 	m.Table = table.NewModel(
 		*ctx,
@@ -210,26 +252,361 @@ func (m *BaseModel) HasRepoNameInConfiguredFilter() bool {
 
 func (m *BaseModel) GetSearchValue() string {
 	searchValue := m.enrichSearchWithTemplateVars()
-	repo, err := repository.Current()
-	if err != nil {
-		return searchValue
+
+	// If there's a custom repo filter set via the picker, use it
+	if m.CustomRepoFilter != "" {
+		return m.applyRepoFilter(searchValue, m.CustomRepoFilter)
+	}
+
+	// Get origin repo from git remote (not repository.Current() which may resolve to upstream)
+	originOwner, originName, hasOrigin := m.GetOriginRepo()
+	if !hasOrigin {
+		return m.applyAuthorFilter(searchValue)
 	}
 
 	if m.HasRepoNameInConfiguredFilter() {
-		return searchValue
+		return m.applyAuthorFilter(searchValue)
 	}
-	currentCloneFilter := fmt.Sprintf("repo:%s/%s", repo.Owner, repo.Name)
-	var searchValueWithoutCurrentCloneFilter []string
+
+	// Check if the user manually added a repo: filter in the search
+	if m.hasManualRepoFilter(searchValue) {
+		// User has manually specified a repo filter, respect it
+		return m.applyAuthorFilter(searchValue)
+	}
+
+	// Remove any existing repo filters from the search value
+	var tokensWithoutRepoFilter []string
 	for token := range strings.FieldsSeq(searchValue) {
-		if !strings.HasPrefix(token, currentCloneFilter) {
-			searchValueWithoutCurrentCloneFilter = append(searchValueWithoutCurrentCloneFilter, token)
+		if !strings.HasPrefix(token, "repo:") {
+			tokensWithoutRepoFilter = append(tokensWithoutRepoFilter, token)
 		}
 	}
-	if m.IsFilteredByCurrentRemote {
-		return fmt.Sprintf("%s %s", currentCloneFilter,
-			strings.Join(searchValueWithoutCurrentCloneFilter, " "))
+	searchValueWithoutRepoFilter := strings.Join(tokensWithoutRepoFilter, " ")
+
+	// Apply the appropriate repo filter based on FilterTarget
+	var result string
+	switch m.FilterTarget {
+	case FilterTargetOrigin:
+		result = fmt.Sprintf("repo:%s/%s %s", originOwner, originName, searchValueWithoutRepoFilter)
+	case FilterTargetUpstream:
+		upstreamOwner, upstreamName, hasUpstream := m.GetUpstreamRepo()
+		if hasUpstream {
+			result = fmt.Sprintf("repo:%s/%s %s", upstreamOwner, upstreamName, searchValueWithoutRepoFilter)
+		} else {
+			// No upstream found, fall back to origin
+			result = fmt.Sprintf("repo:%s/%s %s", originOwner, originName, searchValueWithoutRepoFilter)
+		}
+	default:
+		result = searchValueWithoutRepoFilter
 	}
-	return strings.Join(searchValueWithoutCurrentCloneFilter, " ")
+
+	return m.applyAuthorFilter(result)
+}
+
+// hasManualRepoFilter checks if the search value contains a manually-entered repo filter
+// that differs from what would be auto-applied by FilterTarget
+func (m *BaseModel) hasManualRepoFilter(searchValue string) bool {
+	for token := range strings.FieldsSeq(searchValue) {
+		if strings.HasPrefix(token, "repo:") {
+			// There's a repo filter - check if it matches our auto-applied filters
+			repoValue := strings.TrimPrefix(token, "repo:")
+
+			// Get origin from git remote (not repository.Current())
+			originOwner, originName, hasOrigin := m.GetOriginRepo()
+			if !hasOrigin {
+				return true // Can't determine, assume it's manual
+			}
+
+			originRepo := fmt.Sprintf("%s/%s", originOwner, originName)
+			if repoValue == originRepo && m.FilterTarget == FilterTargetOrigin {
+				return false // Matches auto-applied origin
+			}
+
+			upstreamOwner, upstreamName, hasUpstream := m.GetUpstreamRepo()
+			if hasUpstream {
+				upstreamRepo := fmt.Sprintf("%s/%s", upstreamOwner, upstreamName)
+				if repoValue == upstreamRepo && m.FilterTarget == FilterTargetUpstream {
+					return false // Matches auto-applied upstream
+				}
+			}
+
+			// It's a different repo filter, treat as manual
+			return true
+		}
+	}
+	return false
+}
+
+// applyRepoFilter applies a specific repo filter to the search value
+func (m *BaseModel) applyRepoFilter(searchValue, repoFilter string) string {
+	// Remove any existing repo filters
+	var tokensWithoutRepoFilter []string
+	for token := range strings.FieldsSeq(searchValue) {
+		if !strings.HasPrefix(token, "repo:") {
+			tokensWithoutRepoFilter = append(tokensWithoutRepoFilter, token)
+		}
+	}
+	searchValueWithoutRepoFilter := strings.Join(tokensWithoutRepoFilter, " ")
+
+	var result string
+	if repoFilter == "" {
+		result = searchValueWithoutRepoFilter
+	} else {
+		result = fmt.Sprintf("repo:%s %s", repoFilter, searchValueWithoutRepoFilter)
+	}
+
+	return m.applyAuthorFilter(result)
+}
+
+// applyAuthorFilter removes author:@me from the search if IsAuthorFilterRemoved is true
+func (m *BaseModel) applyAuthorFilter(searchValue string) string {
+	if !m.IsAuthorFilterRemoved {
+		return searchValue
+	}
+
+	var tokensWithoutAuthor []string
+	for token := range strings.FieldsSeq(searchValue) {
+		if token != "author:@me" {
+			tokensWithoutAuthor = append(tokensWithoutAuthor, token)
+		}
+	}
+	return strings.Join(tokensWithoutAuthor, " ")
+}
+
+// getRepoDir returns the directory to use for git operations.
+// Uses m.Ctx.RepoPath if available, otherwise falls back to ".".
+func (m *BaseModel) getRepoDir() string {
+	if m.Ctx != nil && m.Ctx.RepoPath != "" {
+		return m.Ctx.RepoPath
+	}
+	return "."
+}
+
+// GetOriginRepo returns the owner and name of the origin repository
+func (m *BaseModel) GetOriginRepo() (owner, name string, hasOrigin bool) {
+	originUrl, err := git.GetOriginUrl(m.getRepoDir())
+	if err != nil {
+		return "", "", false
+	}
+	owner, name, err = git.ParseGitHubRepoFromUrl(originUrl)
+	if err != nil {
+		return "", "", false
+	}
+	return owner, name, true
+}
+
+// GetUpstreamRepo returns the owner and name of the upstream repository, if available
+func (m *BaseModel) GetUpstreamRepo() (owner, name string, hasUpstream bool) {
+	upstreamUrl, err := git.GetUpstreamUrl(m.getRepoDir())
+	if err != nil {
+		return "", "", false
+	}
+	owner, name, err = git.ParseGitHubRepoFromUrl(upstreamUrl)
+	if err != nil {
+		return "", "", false
+	}
+	return owner, name, true
+}
+
+// HasUpstreamRemote returns true if an upstream remote is configured
+func (m *BaseModel) HasUpstreamRemote() bool {
+	_, _, hasUpstream := m.GetUpstreamRepo()
+	return hasUpstream
+}
+
+// ToggleFilterTarget cycles through filter targets: Origin -> Upstream -> None -> Origin
+func (m *BaseModel) ToggleFilterTarget() {
+	if m.HasRepoNameInConfiguredFilter() {
+		return // Don't toggle if repo is explicitly set in config
+	}
+
+	hasUpstream := m.HasUpstreamRemote()
+
+	switch m.FilterTarget {
+	case FilterTargetOrigin:
+		if hasUpstream {
+			m.FilterTarget = FilterTargetUpstream
+		} else {
+			m.FilterTarget = FilterTargetNone
+		}
+	case FilterTargetUpstream:
+		m.FilterTarget = FilterTargetNone
+	case FilterTargetNone:
+		m.FilterTarget = FilterTargetOrigin
+	}
+
+	// Keep IsFilteredByCurrentRemote in sync for backward compatibility
+	m.IsFilteredByCurrentRemote = m.FilterTarget != FilterTargetNone
+}
+
+// ToggleAuthorFilter toggles whether the author:@me filter is removed
+func (m *BaseModel) ToggleAuthorFilter() {
+	m.IsAuthorFilterRemoved = !m.IsAuthorFilterRemoved
+}
+
+// ShowRepoPicker shows the repo picker with available options
+func (m *BaseModel) ShowRepoPicker() tea.Cmd {
+	options := m.buildRepoPickerOptions()
+	m.RepoPicker.SetOptions(options)
+	m.RepoPicker.SetWidth(50)
+
+	// Set the current selection
+	currentRepo := m.getCurrentRepoFilter()
+	m.RepoPicker.SetSelectedValue(currentRepo)
+
+	m.RepoPicker.Focus()
+	m.IsRepoPickerShown = true
+	return nil
+}
+
+// HideRepoPicker hides the repo picker
+func (m *BaseModel) HideRepoPicker() {
+	m.RepoPicker.Blur()
+	m.IsRepoPickerShown = false
+}
+
+// IsRepoPickerFocused returns true if the repo picker is focused
+func (m *BaseModel) IsRepoPickerFocused() bool {
+	return m.IsRepoPickerShown
+}
+
+// SetCustomRepoFilter sets a custom repo filter
+func (m *BaseModel) SetCustomRepoFilter(repo string) {
+	m.CustomRepoFilter = repo
+	// Clear the filter target since we're using a custom filter
+	if repo != "" {
+		m.FilterTarget = FilterTargetNone
+		m.IsFilteredByCurrentRemote = true
+	}
+}
+
+// ClearCustomRepoFilter clears the custom repo filter
+func (m *BaseModel) ClearCustomRepoFilter() {
+	m.CustomRepoFilter = ""
+}
+
+// buildRepoPickerOptions builds the list of repo options for the picker
+func (m *BaseModel) buildRepoPickerOptions() []repopicker.RepoOption {
+	var options []repopicker.RepoOption
+
+	// Add origin (current fork) - use git remote directly, not repository.Current()
+	// which may resolve to the upstream/parent repo
+	originOwner, originName, hasOrigin := m.GetOriginRepo()
+	if hasOrigin {
+		originRepo := fmt.Sprintf("%s/%s", originOwner, originName)
+		options = append(options, repopicker.RepoOption{
+			Label: fmt.Sprintf("Origin: %s", originRepo),
+			Value: originRepo,
+			Desc:  "Your fork / current repo",
+		})
+	}
+
+	// Add upstream if available
+	upstreamOwner, upstreamName, hasUpstream := m.GetUpstreamRepo()
+	if hasUpstream {
+		upstreamRepo := fmt.Sprintf("%s/%s", upstreamOwner, upstreamName)
+		options = append(options, repopicker.RepoOption{
+			Label: fmt.Sprintf("Upstream: %s", upstreamRepo),
+			Value: upstreamRepo,
+			Desc:  "Parent repository",
+		})
+	}
+
+	// Add "All repos" option
+	options = append(options, repopicker.RepoOption{
+		Label: "All Repositories",
+		Value: "",
+		Desc:  "No repo filter",
+	})
+
+	return options
+}
+
+// getCurrentRepoFilter returns the currently active repo filter value
+func (m *BaseModel) getCurrentRepoFilter() string {
+	if m.CustomRepoFilter != "" {
+		return m.CustomRepoFilter
+	}
+
+	switch m.FilterTarget {
+	case FilterTargetOrigin:
+		owner, name, hasOrigin := m.GetOriginRepo()
+		if hasOrigin {
+			return fmt.Sprintf("%s/%s", owner, name)
+		}
+	case FilterTargetUpstream:
+		owner, name, hasUpstream := m.GetUpstreamRepo()
+		if hasUpstream {
+			return fmt.Sprintf("%s/%s", owner, name)
+		}
+	}
+
+	return ""
+}
+
+// HandleRepoSelected handles when a repo is selected from the picker
+func (m *BaseModel) HandleRepoSelected(value string, isCustom bool) {
+	m.HideRepoPicker()
+
+	if value == "" {
+		// "All repos" selected
+		m.CustomRepoFilter = ""
+		m.FilterTarget = FilterTargetNone
+		m.IsFilteredByCurrentRemote = false
+	} else {
+		// Check if value matches origin or upstream
+		originOwner, originName, hasOrigin := m.GetOriginRepo()
+		if hasOrigin {
+			originRepo := fmt.Sprintf("%s/%s", originOwner, originName)
+			if value == originRepo {
+				m.CustomRepoFilter = ""
+				m.FilterTarget = FilterTargetOrigin
+				m.IsFilteredByCurrentRemote = true
+				return
+			}
+		}
+
+		upstreamOwner, upstreamName, hasUpstream := m.GetUpstreamRepo()
+		if hasUpstream {
+			upstreamRepo := fmt.Sprintf("%s/%s", upstreamOwner, upstreamName)
+			if value == upstreamRepo {
+				m.CustomRepoFilter = ""
+				m.FilterTarget = FilterTargetUpstream
+				m.IsFilteredByCurrentRemote = true
+				return
+			}
+		}
+
+		// It's a custom repo
+		m.CustomRepoFilter = value
+		m.FilterTarget = FilterTargetNone
+		m.IsFilteredByCurrentRemote = true
+	}
+}
+
+// GetFilterTargetLabel returns a human-readable label for the current filter target
+func (m *BaseModel) GetFilterTargetLabel() string {
+	// If there's a custom repo filter, show it
+	if m.CustomRepoFilter != "" {
+		return m.CustomRepoFilter
+	}
+
+	switch m.FilterTarget {
+	case FilterTargetOrigin:
+		owner, name, hasOrigin := m.GetOriginRepo()
+		if hasOrigin {
+			return fmt.Sprintf("%s/%s", owner, name)
+		}
+		return "origin"
+	case FilterTargetUpstream:
+		owner, name, hasUpstream := m.GetUpstreamRepo()
+		if hasUpstream {
+			return fmt.Sprintf("%s/%s", owner, name)
+		}
+		return "upstream"
+	default:
+		return "all"
+	}
 }
 
 func (m *BaseModel) enrichSearchWithTemplateVars() string {
@@ -266,6 +643,7 @@ func (m *BaseModel) UpdateProgramContext(ctx *context.ProgramContext) {
 	m.Table.UpdateProgramContext(ctx)
 	m.Table.SyncViewPortContent()
 	m.SearchBar.UpdateProgramContext(ctx)
+	m.RepoPicker.UpdateProgramContext(ctx)
 }
 
 type SectionRowsFetchedMsg struct {
@@ -407,11 +785,28 @@ func (m *BaseModel) GetMainContent() string {
 
 func (m *BaseModel) View() string {
 	search := m.SearchBar.View(m.Ctx)
+
+	mainContent := m.GetMainContent()
+
+	// If repo picker is shown, overlay it on the main content
+	if m.IsRepoPickerShown {
+		pickerView := m.RepoPicker.View()
+		// Center the picker over the content
+		d := m.GetDimensions()
+		mainContent = lipgloss.Place(
+			d.Width,
+			d.Height,
+			lipgloss.Center,
+			lipgloss.Center,
+			pickerView,
+		)
+	}
+
 	return m.Ctx.Styles.Section.ContainerStyle.Render(
 		lipgloss.JoinVertical(
 			lipgloss.Left,
 			search,
-			m.GetMainContent(),
+			mainContent,
 		),
 	)
 }
