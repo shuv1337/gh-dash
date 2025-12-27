@@ -11,6 +11,7 @@ import (
 	"github.com/dlvhdr/gh-dash/v4/internal/config"
 	"github.com/dlvhdr/gh-dash/v4/internal/data"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/prrow"
+	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/repopicker"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/section"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/table"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/tasks"
@@ -77,6 +78,12 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 			break
 		}
 
+		if m.IsRepoPickerFocused() {
+			var pickerCmd tea.Cmd
+			m.RepoPicker, pickerCmd = m.RepoPicker.Update(msg)
+			return m, pickerCmd
+		}
+
 		if m.IsPromptConfirmationFocused() {
 			switch msg.Type {
 			case tea.KeyCtrlC, tea.KeyEsc:
@@ -120,6 +127,14 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 		case key.Matches(msg, keys.PRKeys.ToggleSmartFiltering):
 			if !m.HasRepoNameInConfiguredFilter() {
 				m.IsFilteredByCurrentRemote = !m.IsFilteredByCurrentRemote
+				// Sync FilterTarget with the toggle
+				if m.IsFilteredByCurrentRemote {
+					m.FilterTarget = section.FilterTargetOrigin
+				} else {
+					m.FilterTarget = section.FilterTargetNone
+				}
+				// Clear custom filter when using toggle
+				m.ClearCustomRepoFilter()
 			}
 			searchValue := m.GetSearchValue()
 			if m.SearchValue != searchValue {
@@ -130,6 +145,34 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 				return m, tea.Batch(m.FetchNextPageSectionRows()...)
 			}
 
+		case key.Matches(msg, keys.PRKeys.ToggleRepoFilter):
+			// Clear custom filter when cycling
+			m.ClearCustomRepoFilter()
+			m.ToggleFilterTarget()
+			searchValue := m.GetSearchValue()
+			if m.SearchValue != searchValue {
+				m.SearchValue = searchValue
+				m.SearchBar.SetValue(searchValue)
+				m.SetIsSearching(false)
+				m.ResetRows()
+				return m, tea.Batch(m.FetchNextPageSectionRows()...)
+			}
+
+		case key.Matches(msg, keys.PRKeys.ToggleAuthorFilter):
+			m.ToggleAuthorFilter()
+			searchValue := m.GetSearchValue()
+			if m.SearchValue != searchValue {
+				m.SearchValue = searchValue
+				m.SearchBar.SetValue(searchValue)
+				m.SetIsSearching(false)
+				m.ResetRows()
+				return m, tea.Batch(m.FetchNextPageSectionRows()...)
+			}
+
+		case key.Matches(msg, keys.PRKeys.OpenRepoPicker):
+			m.ShowRepoPicker()
+			return m, nil
+
 		case key.Matches(msg, keys.PRKeys.Checkout):
 			cmd, err = m.checkout()
 			if err != nil {
@@ -139,6 +182,19 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 		case key.Matches(msg, keys.PRKeys.WatchChecks):
 			cmd = m.watchChecks()
 		}
+
+	case repopicker.RepoSelectedMsg:
+		m.HandleRepoSelected(msg.Value, msg.IsCustom)
+		searchValue := m.GetSearchValue()
+		if m.SearchValue != searchValue {
+			m.SearchValue = searchValue
+			m.SearchBar.SetValue(searchValue)
+			m.ResetRows()
+			return m, tea.Batch(m.FetchNextPageSectionRows()...)
+		}
+
+	case repopicker.RepoCancelledMsg:
+		m.HideRepoPicker()
 
 	case tasks.UpdatePRMsg:
 		for i, currPr := range m.Prs {
