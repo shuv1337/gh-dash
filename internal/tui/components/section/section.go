@@ -337,6 +337,26 @@ func (m *BaseModel) hasManualRepoFilter(searchValue string) bool {
 	return false
 }
 
+// StripRepoFilterTokens removes any repo:... tokens from a search string.
+func StripRepoFilterTokens(searchValue string) string {
+	var tokensWithoutRepoFilter []string
+	for token := range strings.FieldsSeq(searchValue) {
+		if !strings.HasPrefix(token, "repo:") {
+			tokensWithoutRepoFilter = append(tokensWithoutRepoFilter, token)
+		}
+	}
+	return strings.Join(tokensWithoutRepoFilter, " ")
+}
+
+func getRepoFilterTokenValue(searchValue string) (string, bool) {
+	for token := range strings.FieldsSeq(searchValue) {
+		if strings.HasPrefix(token, "repo:") {
+			return strings.TrimPrefix(token, "repo:"), true
+		}
+	}
+	return "", false
+}
+
 // applyRepoFilter applies a specific repo filter to the search value
 func (m *BaseModel) applyRepoFilter(searchValue, repoFilter string) string {
 	// Remove any existing repo filters
@@ -349,9 +369,12 @@ func (m *BaseModel) applyRepoFilter(searchValue, repoFilter string) string {
 	searchValueWithoutRepoFilter := strings.Join(tokensWithoutRepoFilter, " ")
 
 	var result string
-	if repoFilter == "" {
+	switch {
+	case repoFilter == "":
 		result = searchValueWithoutRepoFilter
-	} else {
+	case searchValueWithoutRepoFilter == "":
+		result = fmt.Sprintf("repo:%s", repoFilter)
+	default:
 		result = fmt.Sprintf("repo:%s %s", repoFilter, searchValueWithoutRepoFilter)
 	}
 
@@ -450,8 +473,8 @@ func (m *BaseModel) ShowRepoPicker() tea.Cmd {
 	m.RepoPicker.SetOptions(options)
 	m.RepoPicker.SetWidth(50)
 
-	// Set the current selection
-	currentRepo := m.getCurrentRepoFilter()
+	// Set the current selection based on the search query (source of truth)
+	currentRepo, _ := getRepoFilterTokenValue(m.SearchValue)
 	m.RepoPicker.SetSelectedValue(currentRepo)
 
 	m.RepoPicker.Focus()
@@ -483,6 +506,42 @@ func (m *BaseModel) SetCustomRepoFilter(repo string) {
 // ClearCustomRepoFilter clears the custom repo filter
 func (m *BaseModel) ClearCustomRepoFilter() {
 	m.CustomRepoFilter = ""
+}
+
+func (m *BaseModel) SyncRepoFilterStateFromSearchValue() {
+	repoValue, ok := getRepoFilterTokenValue(m.SearchValue)
+	if !ok || repoValue == "" {
+		m.CustomRepoFilter = ""
+		m.FilterTarget = FilterTargetNone
+		m.IsFilteredByCurrentRemote = false
+		return
+	}
+
+	originOwner, originName, hasOrigin := m.GetOriginRepo()
+	if hasOrigin {
+		originRepo := fmt.Sprintf("%s/%s", originOwner, originName)
+		if repoValue == originRepo {
+			m.CustomRepoFilter = ""
+			m.FilterTarget = FilterTargetOrigin
+			m.IsFilteredByCurrentRemote = true
+			return
+		}
+	}
+
+	upstreamOwner, upstreamName, hasUpstream := m.GetUpstreamRepo()
+	if hasUpstream {
+		upstreamRepo := fmt.Sprintf("%s/%s", upstreamOwner, upstreamName)
+		if repoValue == upstreamRepo {
+			m.CustomRepoFilter = ""
+			m.FilterTarget = FilterTargetUpstream
+			m.IsFilteredByCurrentRemote = true
+			return
+		}
+	}
+
+	m.CustomRepoFilter = repoValue
+	m.FilterTarget = FilterTargetNone
+	m.IsFilteredByCurrentRemote = true
 }
 
 // buildRepoPickerOptions builds the list of repo options for the picker

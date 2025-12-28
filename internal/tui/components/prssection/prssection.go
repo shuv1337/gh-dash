@@ -70,12 +70,17 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 
 			case tea.KeyEnter:
 				m.SearchValue = m.SearchBar.Value()
+				m.SyncRepoFilterStateFromSearchValue()
 				m.SetIsSearching(false)
 				m.ResetRows()
 				return m, tea.Batch(m.FetchNextPageSectionRows()...)
-			}
 
-			break
+			default:
+				// Forward all other keys to the search bar for input
+				var searchCmd tea.Cmd
+				m.SearchBar, searchCmd = m.SearchBar.Update(msg)
+				return m, searchCmd
+			}
 		}
 
 		if m.IsRepoPickerFocused() {
@@ -125,38 +130,54 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 			cmd = m.diff()
 
 		case key.Matches(msg, keys.PRKeys.ToggleSmartFiltering):
-			if !m.HasRepoNameInConfiguredFilter() {
-				m.IsFilteredByCurrentRemote = !m.IsFilteredByCurrentRemote
-				// Sync FilterTarget with the toggle
-				if m.IsFilteredByCurrentRemote {
-					m.FilterTarget = section.FilterTargetOrigin
-				} else {
-					m.FilterTarget = section.FilterTargetNone
-				}
-				// Clear custom filter when using toggle
-				m.ClearCustomRepoFilter()
+			if m.HasRepoNameInConfiguredFilter() {
+				break
 			}
+
+			m.SyncRepoFilterStateFromSearchValue()
+			m.IsFilteredByCurrentRemote = !m.IsFilteredByCurrentRemote
+			// Sync FilterTarget with the toggle
+			if m.IsFilteredByCurrentRemote {
+				m.FilterTarget = section.FilterTargetOrigin
+			} else {
+				m.FilterTarget = section.FilterTargetNone
+			}
+			// Clear custom filter when using toggle
+			m.ClearCustomRepoFilter()
+
+			searchValueBefore := m.SearchValue
+			m.SearchValue = section.StripRepoFilterTokens(m.SearchValue)
 			searchValue := m.GetSearchValue()
-			if m.SearchValue != searchValue {
+			if searchValueBefore != searchValue {
 				m.SearchValue = searchValue
 				m.SearchBar.SetValue(searchValue)
 				m.SetIsSearching(false)
 				m.ResetRows()
 				return m, tea.Batch(m.FetchNextPageSectionRows()...)
 			}
+			m.SearchValue = searchValueBefore
 
 		case key.Matches(msg, keys.PRKeys.ToggleRepoFilter):
+			if m.HasRepoNameInConfiguredFilter() {
+				break
+			}
+
+			m.SyncRepoFilterStateFromSearchValue()
 			// Clear custom filter when cycling
 			m.ClearCustomRepoFilter()
 			m.ToggleFilterTarget()
+
+			searchValueBefore := m.SearchValue
+			m.SearchValue = section.StripRepoFilterTokens(m.SearchValue)
 			searchValue := m.GetSearchValue()
-			if m.SearchValue != searchValue {
+			if searchValueBefore != searchValue {
 				m.SearchValue = searchValue
 				m.SearchBar.SetValue(searchValue)
 				m.SetIsSearching(false)
 				m.ResetRows()
 				return m, tea.Batch(m.FetchNextPageSectionRows()...)
 			}
+			m.SearchValue = searchValueBefore
 
 		case key.Matches(msg, keys.PRKeys.ToggleAuthorFilter):
 			m.ToggleAuthorFilter()
@@ -185,13 +206,13 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 
 	case repopicker.RepoSelectedMsg:
 		m.HandleRepoSelected(msg.Value, msg.IsCustom)
+		m.SearchValue = section.StripRepoFilterTokens(m.SearchValue)
 		searchValue := m.GetSearchValue()
-		if m.SearchValue != searchValue {
-			m.SearchValue = searchValue
-			m.SearchBar.SetValue(searchValue)
-			m.ResetRows()
-			return m, tea.Batch(m.FetchNextPageSectionRows()...)
-		}
+		// Always refetch after repo selection to ensure the filter is applied
+		m.SearchValue = searchValue
+		m.SearchBar.SetValue(searchValue)
+		m.ResetRows()
+		return m, tea.Batch(m.FetchNextPageSectionRows()...)
 
 	case repopicker.RepoCancelledMsg:
 		m.HideRepoPicker()
